@@ -1,0 +1,63 @@
+[Unit]
+Description=Dahua NVR to MQTT bridge
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=dahua
+Group=dahua
+WorkingDirectory=/opt/dahua2mqtt
+
+# -------------------------------------------------------------------
+# Gunicorn — loads dahua2mqtt.py → app
+# CONFIG_FILE is optional, defaults to /etc/dahua2mqtt/config.yaml
+# -------------------------------------------------------------------
+ExecStart=/usr/bin/env CONFIG_FILE=/etc/dahua2mqtt/config.yaml \
+  /usr/bin/gunicorn --workers 1 --bind 0.0.0.0:${PORT} \
+  "dahua2mqtt:app"
+
+# -------------------------------------------------------------------
+# Environment (defaults, config.yaml overrides)
+# -------------------------------------------------------------------
+Environment="PORT=8080"
+Environment="CONFIG_FILE=/etc/dahua2mqtt/config.yaml"
+Environment="LOG_LEVEL=INFO"
+
+# -------------------------------------------------------------------
+# Restart policy
+# -------------------------------------------------------------------
+Restart=always
+RestartSec=2
+
+# -------------------------------------------------------------------
+# Security Hardening
+# -------------------------------------------------------------------
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+
+ReadOnlyPaths=/opt/dahua2mqtt
+ReadWritePaths=/var/log/dahua2mqtt
+
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+RestrictAddressFamilies=AF_INET AF_INET6
+DevicePolicy=closed
+ProtectProc=invisible
+
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+
+SystemCallFilter=@system-service
+RestrictSUIDSGID=yes
+MemoryDenyWriteExecute=true
+LockPersonality=true
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
