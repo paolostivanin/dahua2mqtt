@@ -17,14 +17,21 @@ cameras:
 # ─── HTTP listener (receives events from Dahua NVR) ─────────────
 port: 8080
 
+# ─── Security ────────────────────────────────────────────────────
+# Restrict incoming requests to these source IPs.
+# Empty list (default) = allow all.
+# allowed_ips:
+#   - "192.168.1.100"
+#   - "10.0.0.5"
+
+# Set to true if behind a reverse proxy, to check X-Forwarded-For header.
+# trust_proxy: false
+
 # ─── Logging ─────────────────────────────────────────────────────
 logfile: "/var/log/dahua2mqtt/dahua2mqtt.log"
 log_level: "INFO"          # DEBUG / INFO / WARNING / ERROR
 
 # ─── Event handling ──────────────────────────────────────────────
-# Drop unmatched events after this many seconds.
-event_ttl: 120
-
 # Suppress repeated events per rule name within this window (seconds).
 # 0 = disabled. Each rule is tracked independently.
 anti_dither: 0
