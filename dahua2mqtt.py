@@ -39,11 +39,13 @@ PORT = int(cfg("port", 8080))
 LOGFILE = cfg("logfile", "/var/log/dahua2mqtt/dahua2mqtt.log")
 LOG_LEVEL = cfg("log_level", "INFO").upper()
 
-EVENT_TTL = int(cfg("event_ttl", 120))
 ANTI_DITHER = int(cfg("anti_dither", 0))
 OFF_DELAY = int(cfg("off_delay", 10))
 
 CAMERAS = CFG.get("cameras", [])
+
+ALLOWED_IPS = set(CFG.get("allowed_ips", []))
+TRUST_PROXY = str(cfg("trust_proxy", False)).lower() in ("true", "1", "yes")
 
 mqtt_cfg = CFG.get("mqtt", {})
 MQTT_HOST = os.getenv("MQTT_HOST", mqtt_cfg.get("host", "localhost"))
@@ -80,7 +82,12 @@ app_start_time = time.time()
 logger = logging.getLogger("dahua2mqtt")
 logger.setLevel(getattr(logging, LOG_LEVEL, logging.INFO))
 
-handler = RotatingFileHandler(LOGFILE, maxBytes=5_000_000, backupCount=5)
+try:
+    handler = RotatingFileHandler(LOGFILE, maxBytes=5_000_000, backupCount=5)
+except (OSError, IOError) as e:
+    print(f"WARNING: Cannot open log file {LOGFILE}: {e} — falling back to stderr", file=sys.stderr)
+    handler = logging.StreamHandler(sys.stderr)
+
 formatter = logging.Formatter(
     "%(asctime)s [%(levelname)s] %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S")
@@ -90,12 +97,10 @@ logger.addHandler(handler)
 # ===================================================================
 # INTERNAL STATE
 # ===================================================================
-pending_events: dict[str, tuple[float, dict]] = {}
 anti_dither_last: dict[str, float] = {}
 
 stats = {
     "events_received": 0,
-    "events_dropped": 0,
     "events_anti_dithered": 0,
     "events_ignored": 0,
     "mqtt_publish_ok": 0,
@@ -143,22 +148,23 @@ def publish_discovery():
                 mqtt_client.publish(
                     discovery_topic, json.dumps(payload), retain=True,
                 )
-                logger.debug(f"Discovery published: {discovery_topic}")
+                logger.debug("Discovery published: %s", discovery_topic)
 
     logger.info(
-        f"HA discovery published for {len(CAMERAS)} camera(s), "
-        f"{len(CAMERAS) * 4} sensors"
+        "HA discovery published for %d camera(s), %d sensors",
+        len(CAMERAS),
+        len(CAMERAS) * len(EVENT_MAP) * len(OBJECT_TYPES),
     )
 
 
 def on_connect(client, userdata, flags, reason_code, properties=None):
-    logger.info(f"MQTT connected ({reason_code})")
+    logger.info("MQTT connected (%s)", reason_code)
     client.publish(f"{TOPIC_PREFIX}/status", "online", retain=True)
     publish_discovery()
 
 
 def on_disconnect(client, userdata, flags, reason_code, properties=None):
-    logger.warning(f"MQTT disconnected ({reason_code})")
+    logger.warning("MQTT disconnected (%s)", reason_code)
 
 
 mqtt_client.on_connect = on_connect
@@ -196,19 +202,22 @@ def validate_event(raw: dict) -> tuple[bool, str]:
 # ===================================================================
 # CLEANUP STALE ENTRIES
 # ===================================================================
-def cleanup_pending():
-    now = time.time()
-
-    for uuid, (ts, _) in list(pending_events.items()):
-        if now - ts > EVENT_TTL:
-            pending_events.pop(uuid, None)
-            stats["events_dropped"] += 1
-            logger.info(f"Dropped stale event UUID={uuid} (> {EVENT_TTL}s)")
-
+def cleanup_anti_dither():
     if ANTI_DITHER > 0:
+        now = time.time()
         for key, ts in list(anti_dither_last.items()):
             if now - ts > ANTI_DITHER:
                 anti_dither_last.pop(key, None)
+
+
+# ===================================================================
+# MQTT TOPIC SANITIZATION
+# ===================================================================
+def sanitize_mqtt(value: str) -> str:
+    """Strip characters illegal or dangerous in MQTT topic segments."""
+    for ch in "/+#\x00":
+        value = value.replace(ch, "")
+    return value
 
 
 # ===================================================================
@@ -249,6 +258,11 @@ def extract_object_types(data: dict, name: str) -> list[str]:
         if part == "h":
             types.add("human")
 
+    if not types:
+        logger.warning(
+            "No object type found in payload or rule name %r, defaulting to both",
+            name,
+        )
     return list(types) if types else ["vehicle", "human"]
 
 
@@ -258,21 +272,21 @@ def extract_object_types(data: dict, name: str) -> list[str]:
 def extract_camera(name: str) -> str:
     if not name:
         return "unknown"
-    return name.split("_", 1)[0]
+    return sanitize_mqtt(name.split("_", 1)[0])
 
 
 # ===================================================================
 # PUBLISH TO MQTT
 # ===================================================================
 def publish_event(camera: str, sensor_type: str, obj_type: str):
-    topic = f"{TOPIC_PREFIX}/{camera}/{sensor_type}/{obj_type}"
+    topic = f"{TOPIC_PREFIX}/{sanitize_mqtt(camera)}/{sanitize_mqtt(sensor_type)}/{sanitize_mqtt(obj_type)}"
     result = mqtt_client.publish(topic, "ON")
     if result.rc == mqtt.MQTT_ERR_SUCCESS:
         stats["mqtt_publish_ok"] += 1
-        logger.info(f"Published ON → {topic}")
+        logger.info("Published ON → %s", topic)
     else:
         stats["mqtt_publish_fail"] += 1
-        logger.error(f"Publish failed ({result.rc}) → {topic}")
+        logger.error("Publish failed (%s) → %s", result.rc, topic)
 
 
 # ===================================================================
@@ -287,17 +301,17 @@ def handle_event(uuid: str, event_json: dict):
     sensor_type = EVENT_MAP.get(code)
     if sensor_type is None:
         stats["events_ignored"] += 1
-        logger.debug(f"Ignoring event code={code} UUID={uuid}")
+        logger.debug("Ignoring event code=%s UUID=%s", code, uuid)
         return
 
     if ANTI_DITHER > 0:
-        dither_key = name or camera
+        dither_key = f"{camera}:{sensor_type}:{name}" if name else f"{camera}:{sensor_type}"
         last_ts = anti_dither_last.get(dither_key)
         if last_ts is not None and (time.time() - last_ts) < ANTI_DITHER:
             stats["events_anti_dithered"] += 1
             logger.info(
-                f"Anti-dither suppressed UUID={uuid} cam={camera} "
-                f"type={sensor_type}"
+                "Anti-dither suppressed UUID=%s cam=%s type=%s",
+                uuid, camera, sensor_type,
             )
             return
         anti_dither_last[dither_key] = time.time()
@@ -308,27 +322,43 @@ def handle_event(uuid: str, event_json: dict):
 
 
 # ===================================================================
+# IP ALLOWLIST
+# ===================================================================
+@app.before_request
+def check_ip_allowlist():
+    if not ALLOWED_IPS:
+        return None
+    if TRUST_PROXY:
+        ip = request.headers.get("X-Forwarded-For", "").split(",")[0].strip()
+    else:
+        ip = request.remote_addr
+    if ip not in ALLOWED_IPS:
+        logger.warning("Rejected request from %s", ip)
+        return "Forbidden", 403
+    return None
+
+
+# ===================================================================
 # FLASK ROUTES
 # ===================================================================
 @app.post("/cgi-bin/NotifyEvent")
 def notify():
-    cleanup_pending()
+    cleanup_anti_dither()
 
-    raw = request.json or {}
+    raw = request.get_json(silent=True) or {}
     valid, err = validate_event(raw)
     if not valid:
-        logger.warning(f"Invalid event: {err}")
+        logger.warning("Invalid event: %s", err)
         return "OK", 200
 
     data = raw.get("Data", {})
     uuid = data["EventUUIDStr"]
 
-    pending_events[uuid] = (time.time(), raw)
     stats["events_received"] += 1
 
     code = data.get("Code", "unknown")
     camera = extract_camera(data.get("Name"))
-    logger.info(f"Received START UUID={uuid} code={code} cam={camera}")
+    logger.info("Received START UUID=%s code=%s cam=%s", uuid, code, camera)
 
     handle_event(uuid, raw)
 
@@ -337,26 +367,23 @@ def notify():
 
 @app.get("/health")
 def health():
-    cleanup_pending()
+    cleanup_anti_dither()
     return {
         "status": "ok",
-        "pending_events": len(pending_events),
         "mqtt_connected": mqtt_client.is_connected(),
     }, 200
 
 
 @app.get("/stats")
 def stats_endpoint():
-    cleanup_pending()
+    cleanup_anti_dither()
     uptime = int(time.time() - app_start_time)
     return {
         **stats,
-        "pending_events": len(pending_events),
         "mqtt_connected": mqtt_client.is_connected(),
         "uptime_seconds": uptime,
         "uptime_formatted": f"{uptime // 3600}h {(uptime % 3600) // 60}m",
         "config": {
-            "event_ttl": EVENT_TTL,
             "anti_dither": ANTI_DITHER,
             "off_delay": OFF_DELAY,
             "cameras": CAMERAS,
@@ -371,13 +398,15 @@ def root():
 
 @app.post("/<path:subpath>")
 def catch_post(subpath):
-    logger.info(f"Unknown POST to /{subpath}")
+    safe_subpath = subpath.replace("\n", "").replace("\r", "")
+    logger.info("Unknown POST to /%s", safe_subpath)
     return "OK", 200
 
 
 @app.get("/<path:subpath>")
 def catch_get(subpath):
-    logger.info(f"Unknown GET to /{subpath}")
+    safe_subpath = subpath.replace("\n", "").replace("\r", "")
+    logger.info("Unknown GET to /%s", safe_subpath)
     return "OK", 200
 
 
@@ -389,23 +418,23 @@ def signal_handler(sig, frame):
     mqtt_client.publish(f"{TOPIC_PREFIX}/status", "offline", retain=True)
     mqtt_client.loop_stop()
     mqtt_client.disconnect()
-    cleanup_pending()
-    logger.info(f"Final stats: {stats}")
+    cleanup_anti_dither()
+    logger.info("Final stats: %s", stats)
     sys.exit(0)
-
-signal.signal(signal.SIGTERM, signal_handler)
-signal.signal(signal.SIGINT, signal_handler)
 
 
 # ===================================================================
 # LOCAL DEV MODE
 # ===================================================================
 if __name__ == "__main__":
+    signal.signal(signal.SIGTERM, signal_handler)
+    signal.signal(signal.SIGINT, signal_handler)
+
     logger.info("=" * 50)
     logger.info("dahua2mqtt starting in DEV mode")
-    logger.info(f"LOG_LEVEL={LOG_LEVEL}")
-    logger.info(f"MQTT={MQTT_HOST}:{MQTT_PORT}")
-    logger.info(f"CAMERAS={CAMERAS}")
+    logger.info("LOG_LEVEL=%s", LOG_LEVEL)
+    logger.info("MQTT=%s:%s", MQTT_HOST, MQTT_PORT)
+    logger.info("CAMERAS=%s", CAMERAS)
     logger.info("=" * 50)
 
     app.run(host="0.0.0.0", port=PORT, debug=True)
