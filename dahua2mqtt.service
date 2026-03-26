@@ -7,22 +7,9 @@ Wants=network-online.target
 Type=simple
 User=dahua
 Group=dahua
-WorkingDirectory=/opt/dahua2mqtt
 
-# -------------------------------------------------------------------
-# Gunicorn — loads dahua2mqtt.py → app
-# CONFIG_FILE is optional, defaults to /etc/dahua2mqtt/config.yaml
-# -------------------------------------------------------------------
-ExecStart=/usr/bin/env CONFIG_FILE=/etc/dahua2mqtt/config.yaml \
-  /usr/bin/gunicorn --workers 1 --bind 0.0.0.0:${PORT} \
-  "dahua2mqtt:app"
-
-# -------------------------------------------------------------------
-# Environment (defaults, config.yaml overrides)
-# -------------------------------------------------------------------
-Environment="PORT=8080"
+ExecStart=/opt/dahua2mqtt/dahua2mqtt
 Environment="CONFIG_FILE=/etc/dahua2mqtt/config.yaml"
-Environment="LOG_LEVEL=INFO"
 
 # -------------------------------------------------------------------
 # Restart policy
@@ -53,7 +40,6 @@ ProtectControlGroups=true
 
 SystemCallFilter=@system-service
 RestrictSUIDSGID=yes
-MemoryDenyWriteExecute=true
 LockPersonality=true
 
 StandardOutput=journal
