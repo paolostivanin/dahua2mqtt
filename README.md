@@ -69,6 +69,8 @@ Deploy binary, config, and service:
 sudo cp dahua2mqtt /opt/dahua2mqtt/
 sudo chmod 755 /opt/dahua2mqtt/dahua2mqtt
 sudo cp config.example.yaml /etc/dahua2mqtt/config.yaml  # edit before starting
+sudo chown root:dahua /etc/dahua2mqtt/config.yaml
+sudo chmod 640 /etc/dahua2mqtt/config.yaml
 sudo cp dahua2mqtt.service /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now dahua2mqtt
