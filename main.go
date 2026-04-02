@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -97,7 +98,9 @@ func applyEnvOverrides(cfg *config) {
 		cfg.MQTT.Host = v
 	}
 	if v := os.Getenv("MQTT_PORT"); v != "" {
-		fmt.Sscanf(v, "%d", &cfg.MQTT.Port)
+		if _, err := fmt.Sscanf(v, "%d", &cfg.MQTT.Port); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: invalid MQTT_PORT %q, keeping %d\n", v, cfg.MQTT.Port)
+		}
 	}
 	if v := os.Getenv("MQTT_USERNAME"); v != "" {
 		cfg.MQTT.Username = v
@@ -109,16 +112,22 @@ func applyEnvOverrides(cfg *config) {
 		cfg.Logfile = v
 	}
 	if v := os.Getenv("PORT"); v != "" {
-		fmt.Sscanf(v, "%d", &cfg.Port)
+		if _, err := fmt.Sscanf(v, "%d", &cfg.Port); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: invalid PORT %q, keeping %d\n", v, cfg.Port)
+		}
 	}
 	if v := os.Getenv("LOG_LEVEL"); v != "" {
 		cfg.LogLevel = v
 	}
 	if v := os.Getenv("ANTI_DITHER"); v != "" {
-		fmt.Sscanf(v, "%d", &cfg.AntiDither)
+		if _, err := fmt.Sscanf(v, "%d", &cfg.AntiDither); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: invalid ANTI_DITHER %q, keeping %d\n", v, cfg.AntiDither)
+		}
 	}
 	if v := os.Getenv("OFF_DELAY"); v != "" {
-		fmt.Sscanf(v, "%d", &cfg.OffDelay)
+		if _, err := fmt.Sscanf(v, "%d", &cfg.OffDelay); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: invalid OFF_DELAY %q, keeping %d\n", v, cfg.OffDelay)
+		}
 	}
 	if v := os.Getenv("TRUST_PROXY"); v != "" {
 		v = strings.ToLower(v)
@@ -186,6 +195,7 @@ type app struct {
 	antiDitherMu sync.Mutex
 
 	offTimers   map[string]*time.Timer
+	offTimerGen map[string]uint64
 	offTimersMu sync.Mutex
 
 	allowedIPs map[string]struct{}
@@ -280,8 +290,10 @@ func (a *app) publishEvent(camera, sensorType, objType string) {
 		return
 	}
 	token := a.mqttClient.Publish(topic, 0, false, "ON")
-	token.Wait()
-	if token.Error() != nil {
+	if !token.WaitTimeout(5 * time.Second) {
+		a.stats.MQTTPublishFail.Add(1)
+		a.logger.Error("Publish timed out", "topic", topic)
+	} else if token.Error() != nil {
 		a.stats.MQTTPublishFail.Add(1)
 		a.logger.Error("Publish failed", "topic", topic, "error", token.Error())
 	} else {
@@ -300,18 +312,27 @@ func (a *app) resetOffTimer(camera, sensorType, objType string) {
 	duration := time.Duration(a.cfg.OffDelay) * time.Second
 
 	a.offTimersMu.Lock()
-	defer a.offTimersMu.Unlock()
-
 	if t, ok := a.offTimers[topic]; ok {
 		t.Stop()
 	}
+	a.offTimerGen[topic]++
+	gen := a.offTimerGen[topic]
+	a.offTimersMu.Unlock()
+
 	a.offTimers[topic] = time.AfterFunc(duration, func() {
+		a.offTimersMu.Lock()
+		current := a.offTimerGen[topic]
+		a.offTimersMu.Unlock()
+		if current != gen {
+			return // a newer timer superseded this one
+		}
 		if a.mqttClient == nil {
 			return
 		}
 		token := a.mqttClient.Publish(topic, 0, false, "OFF")
-		token.Wait()
-		if token.Error() != nil {
+		if !token.WaitTimeout(5 * time.Second) {
+			a.logger.Error("Publish OFF timed out", "topic", topic)
+		} else if token.Error() != nil {
 			a.logger.Error("Publish OFF failed", "topic", topic, "error", token.Error())
 		} else {
 			a.logger.Info("Published OFF", "topic", topic)
@@ -463,6 +484,7 @@ func (a *app) handleNotify(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20) // 1 MB limit
 	var raw nvrEvent
 	if err := json.NewDecoder(r.Body).Decode(&raw); err != nil {
 		a.logger.Warn("Invalid JSON", "error", err)
@@ -643,8 +665,9 @@ func main() {
 		cfg:        cfg,
 		startTime:  time.Now(),
 		logger:     logger,
-		antiDither: make(map[string]antiDitherEntry),
-		offTimers:  make(map[string]*time.Timer),
+		antiDither:  make(map[string]antiDitherEntry),
+		offTimers:   make(map[string]*time.Timer),
+		offTimerGen: make(map[string]uint64),
 		allowedIPs: allowedIPs,
 	}
 
@@ -690,7 +713,9 @@ func main() {
 			"mqtt_publish_ok", a.stats.MQTTPublishOK.Load(),
 			"mqtt_publish_fail", a.stats.MQTTPublishFail.Load(),
 		)
-		server.Close()
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		server.Shutdown(ctx)
 	}()
 
 	logger.Info("dahua2mqtt starting",
