@@ -9,8 +9,8 @@ Each camera automatically gets four HA binary sensors:
 
 - **Single static binary** — no runtime dependencies, no Python, no pip. Just `scp` and run.
 - **MQTT discovery** — binary sensors auto-register in HA on startup. No manual YAML sensor definitions needed.
-- **Auto-off** — sensors reset to `OFF` after a configurable delay (`off_delay`), so HA dashboards show real-time detection state without manual reset.
-- **Anti-dither** — suppress repeated events per camera/rule within a configurable time window to reduce notification noise.
+- **Auto-off** — the bridge publishes `OFF` after a configurable delay (`off_delay`), so HA dashboards show real-time detection state without manual reset. The timer resets on every incoming event, even if anti-dither suppresses it.
+- **Anti-dither** — suppress repeated MQTT publishes per camera/rule within a configurable time window to reduce noise, while still extending the OFF timer on every event.
 - **Last Will & Testament** — HA marks sensors as `unavailable` if the bridge crashes or loses connection.
 - **IP allowlist** — optionally restrict which IPs can send events (e.g., NVR VLAN only).
 - **Rotating logs** — automatic log rotation (5 x 5 MB).
@@ -26,8 +26,8 @@ Dahua NVR ──HTTP POST──> dahua2mqtt ──MQTT──> Home Assistant
 
 1. NVR sends an IVS event to `http://<bridge>:<port>/cgi-bin/NotifyEvent`.
 2. The bridge validates and extracts camera name, event type, and object class.
-3. If anti-dither passes, an MQTT message (`ON`) is published to the matching sensor topic.
-4. HA picks it up via MQTT discovery; the sensor auto-resets to `OFF` after `off_delay` seconds.
+3. If anti-dither passes, an MQTT message (`ON`) is published to the matching sensor topic. Either way, the OFF timer resets.
+4. After `off_delay` seconds of inactivity, the bridge publishes `OFF`.
 
 ## MQTT topics
 
