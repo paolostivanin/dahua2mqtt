@@ -28,6 +28,7 @@ func newTestApp(cfg config) *app {
 		startTime:  time.Now(),
 		logger:     logger,
 		antiDither: make(map[string]antiDitherEntry),
+		offTimers:  make(map[string]*time.Timer),
 		allowedIPs: buildAllowedIPs(cfg.AllowedIPs),
 	}
 }
@@ -1183,5 +1184,101 @@ func TestWriteJSON(t *testing.T) {
 	}
 	if result["num"].(float64) != 42 {
 		t.Errorf("num = %v, want 42", result["num"])
+	}
+}
+
+// ===================================================================
+// OFF TIMER TESTS
+// ===================================================================
+
+func TestResetOffTimer_CreatesTimer(t *testing.T) {
+	a := newTestApp(defaultTestConfig())
+	a.cfg.OffDelay = 1
+
+	// No MQTT client — timer will fire but publish is a no-op (nil check)
+	a.resetOffTimer("cam1", "tripwire", "human")
+
+	topic := "dahua2mqtt/cam1/tripwire/human"
+	a.offTimersMu.Lock()
+	_, exists := a.offTimers[topic]
+	a.offTimersMu.Unlock()
+
+	if !exists {
+		t.Error("expected off timer to be created for topic")
+	}
+}
+
+func TestResetOffTimer_ReplacesExistingTimer(t *testing.T) {
+	a := newTestApp(defaultTestConfig())
+	a.cfg.OffDelay = 1
+
+	a.resetOffTimer("cam1", "tripwire", "human")
+
+	topic := "dahua2mqtt/cam1/tripwire/human"
+	a.offTimersMu.Lock()
+	t1 := a.offTimers[topic]
+	a.offTimersMu.Unlock()
+
+	// Reset again — should replace the timer
+	a.resetOffTimer("cam1", "tripwire", "human")
+
+	a.offTimersMu.Lock()
+	t2 := a.offTimers[topic]
+	a.offTimersMu.Unlock()
+
+	if t1 == t2 {
+		t.Error("expected new timer instance after reset")
+	}
+}
+
+func TestAntiDitherSuppressed_ResetsOffTimer(t *testing.T) {
+	cfg := defaultTestConfig()
+	cfg.AntiDither = 5
+	cfg.OffDelay = 10
+	a := newTestApp(cfg)
+
+	data := eventData{
+		Code:         "CrossLineDetection",
+		Name:         "cam1_r1_h_trip",
+		EventUUIDStr: "uuid-1",
+		Object:       &objectInfo{ObjectType: "Human"},
+	}
+
+	// Pre-seed anti-dither so event is suppressed
+	key := "cam1:tripwire:cam1_r1_h_trip"
+	a.antiDither[key] = antiDitherEntry{lastTime: time.Now()}
+
+	a.handleEvent("uuid-2", data)
+
+	// Event should be suppressed
+	if a.stats.EventsAntiDithered.Load() != 1 {
+		t.Fatalf("events_anti_dithered = %d, want 1", a.stats.EventsAntiDithered.Load())
+	}
+
+	// But OFF timer should still have been created/reset
+	topic := "dahua2mqtt/cam1/tripwire/human"
+	a.offTimersMu.Lock()
+	_, exists := a.offTimers[topic]
+	a.offTimersMu.Unlock()
+
+	if !exists {
+		t.Error("expected off timer to be set even when event is anti-dithered")
+	}
+}
+
+func TestResetOffTimer_MultipleTopicsIndependent(t *testing.T) {
+	a := newTestApp(defaultTestConfig())
+	a.cfg.OffDelay = 5
+
+	a.resetOffTimer("cam1", "tripwire", "human")
+	a.resetOffTimer("cam1", "tripwire", "vehicle")
+	a.resetOffTimer("cam2", "intrusion", "human")
+
+	a.offTimersMu.Lock()
+	count := len(a.offTimers)
+	a.offTimersMu.Unlock()
+
+	if count != 3 {
+		t.Errorf("expected 3 independent timers, got %d", count)
 	}
 }

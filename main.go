@@ -185,6 +185,9 @@ type app struct {
 	antiDither   map[string]antiDitherEntry
 	antiDitherMu sync.Mutex
 
+	offTimers   map[string]*time.Timer
+	offTimersMu sync.Mutex
+
 	allowedIPs map[string]struct{}
 }
 
@@ -243,7 +246,6 @@ func (a *app) publishDiscovery() {
 					"state_topic":           stateTopic,
 					"payload_on":            "ON",
 					"payload_off":           "OFF",
-					"off_delay":             a.cfg.OffDelay,
 					"device_class":          "motion",
 					"availability_topic":    topicPrefix + "/status",
 					"payload_available":     "online",
@@ -286,6 +288,35 @@ func (a *app) publishEvent(camera, sensorType, objType string) {
 		a.stats.MQTTPublishOK.Add(1)
 		a.logger.Info("Published ON", "topic", topic)
 	}
+}
+
+func (a *app) resetOffTimer(camera, sensorType, objType string) {
+	topic := fmt.Sprintf("%s/%s/%s/%s",
+		topicPrefix,
+		sanitizeMQTT(camera),
+		sanitizeMQTT(sensorType),
+		sanitizeMQTT(objType),
+	)
+	duration := time.Duration(a.cfg.OffDelay) * time.Second
+
+	a.offTimersMu.Lock()
+	defer a.offTimersMu.Unlock()
+
+	if t, ok := a.offTimers[topic]; ok {
+		t.Stop()
+	}
+	a.offTimers[topic] = time.AfterFunc(duration, func() {
+		if a.mqttClient == nil {
+			return
+		}
+		token := a.mqttClient.Publish(topic, 0, false, "OFF")
+		token.Wait()
+		if token.Error() != nil {
+			a.logger.Error("Publish OFF failed", "topic", topic, "error", token.Error())
+		} else {
+			a.logger.Info("Published OFF", "topic", topic)
+		}
+	})
 }
 
 // ===================================================================
@@ -334,6 +365,10 @@ func (a *app) handleEvent(uuid string, data eventData) {
 			a.antiDitherMu.Unlock()
 			a.stats.EventsAntiDithered.Add(1)
 			a.logger.Info("Anti-dither suppressed", "uuid", uuid, "cam", camera, "type", sensorType)
+			objTypes := extractObjectTypes(data, a.logger)
+			for _, objType := range objTypes {
+				a.resetOffTimer(camera, sensorType, objType)
+			}
 			return
 		}
 		a.antiDither[ditherKey] = antiDitherEntry{lastTime: now}
@@ -343,6 +378,7 @@ func (a *app) handleEvent(uuid string, data eventData) {
 	objTypes := extractObjectTypes(data, a.logger)
 	for _, objType := range objTypes {
 		a.publishEvent(camera, sensorType, objType)
+		a.resetOffTimer(camera, sensorType, objType)
 	}
 }
 
@@ -608,6 +644,7 @@ func main() {
 		startTime:  time.Now(),
 		logger:     logger,
 		antiDither: make(map[string]antiDitherEntry),
+		offTimers:  make(map[string]*time.Timer),
 		allowedIPs: allowedIPs,
 	}
 
@@ -638,6 +675,11 @@ func main() {
 	go func() {
 		<-sigCh
 		logger.Info("Graceful shutdown...")
+		a.offTimersMu.Lock()
+		for _, t := range a.offTimers {
+			t.Stop()
+		}
+		a.offTimersMu.Unlock()
 		a.mqttClient.Publish(topicPrefix+"/status", 1, true, "offline")
 		a.mqttClient.Disconnect(1000)
 		a.cleanupAntiDither()
