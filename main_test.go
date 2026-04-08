@@ -24,12 +24,13 @@ import (
 func newTestApp(cfg config) *app {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	return &app{
-		cfg:        cfg,
-		startTime:  time.Now(),
-		logger:     logger,
-		antiDither: make(map[string]antiDitherEntry),
-		offTimers:  make(map[string]*time.Timer),
-		allowedIPs: buildAllowedIPs(cfg.AllowedIPs),
+		cfg:         cfg,
+		startTime:   time.Now(),
+		logger:      logger,
+		antiDither:  make(map[string]antiDitherEntry),
+		offTimers:   make(map[string]*time.Timer),
+		offTimerGen: make(map[string]uint64),
+		allowedIPs:  buildAllowedIPs(cfg.AllowedIPs),
 	}
 }
 

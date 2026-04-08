@@ -317,8 +317,6 @@ func (a *app) resetOffTimer(camera, sensorType, objType string) {
 	}
 	a.offTimerGen[topic]++
 	gen := a.offTimerGen[topic]
-	a.offTimersMu.Unlock()
-
 	a.offTimers[topic] = time.AfterFunc(duration, func() {
 		a.offTimersMu.Lock()
 		current := a.offTimerGen[topic]
@@ -338,6 +336,7 @@ func (a *app) resetOffTimer(camera, sensorType, objType string) {
 			a.logger.Info("Published OFF", "topic", topic)
 		}
 	})
+	a.offTimersMu.Unlock()
 }
 
 // ===================================================================
@@ -698,14 +697,17 @@ func main() {
 	go func() {
 		<-sigCh
 		logger.Info("Graceful shutdown...")
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		server.Shutdown(ctx)
 		a.offTimersMu.Lock()
 		for _, t := range a.offTimers {
 			t.Stop()
 		}
 		a.offTimersMu.Unlock()
-		a.mqttClient.Publish(topicPrefix+"/status", 1, true, "offline")
+		token := a.mqttClient.Publish(topicPrefix+"/status", 1, true, "offline")
+		token.WaitTimeout(5 * time.Second)
 		a.mqttClient.Disconnect(1000)
-		a.cleanupAntiDither()
 		logger.Info("Final stats",
 			"events_received", a.stats.EventsReceived.Load(),
 			"events_anti_dithered", a.stats.EventsAntiDithered.Load(),
@@ -713,9 +715,6 @@ func main() {
 			"mqtt_publish_ok", a.stats.MQTTPublishOK.Load(),
 			"mqtt_publish_fail", a.stats.MQTTPublishFail.Load(),
 		)
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		server.Shutdown(ctx)
 	}()
 
 	logger.Info("dahua2mqtt starting",
