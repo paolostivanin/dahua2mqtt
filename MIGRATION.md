@@ -86,6 +86,13 @@ anti_dither: 5            # carry over from old config
 off_delay: 10             # seconds before sensor auto-OFF
 ```
 
+Secure the config file (it may contain MQTT credentials):
+
+```bash
+sudo chown root:dahua /etc/dahua2mqtt/config.yaml
+sudo chmod 640 /etc/dahua2mqtt/config.yaml
+```
+
 ### 4. Deploy the binary
 
 ```bash
@@ -162,7 +169,7 @@ sudo systemctl daemon-reload
 
 1. `sudo systemctl stop dahua2mqtt`
 2. `sudo systemctl enable --now dahua-proxy`
-3. NVR endpoint unchanged (same port/path), so events resume immediately
+3. If you changed the HTTP port, update the NVR's notification URL back to the old port
 4. Re-enable HA webhook automations
 
 ## HA automation migration example
