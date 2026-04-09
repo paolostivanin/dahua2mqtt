@@ -347,6 +347,7 @@ func (a *app) resetOffTimer(camera, sensorType, objType string) {
 // NVR event JSON structure.
 type nvrEvent struct {
 	Action string          `json:"Action"`
+	Code   string          `json:"Code"`
 	Data   json.RawMessage `json:"Data"`
 }
 
@@ -513,6 +514,11 @@ func (a *app) handleNotify(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		fmt.Fprint(w, "OK")
 		return
+	}
+
+	// Code lives at the top level in the NVR payload, not inside Data.
+	if data.Code == "" {
+		data.Code = raw.Code
 	}
 
 	a.stats.EventsReceived.Add(1)
