@@ -148,7 +148,7 @@ func envOr(key, fallback string) string {
 // ===================================================================
 
 const (
-	version           = "2.0.1"
+	version           = "2.0.2"
 	topicPrefix       = "dahua2mqtt"
 	haDiscoveryPrefix = "homeassistant"
 )
@@ -252,8 +252,9 @@ func (a *app) publishDiscovery() {
 				stateTopic := fmt.Sprintf("%s/%s/%s/%s", topicPrefix, cam, eventType, objType)
 
 				payload := map[string]any{
-					"name":                  fmt.Sprintf("%s %s %s", cam, eventType, objType),
+					"name":                  fmt.Sprintf("%s %s", eventType, objType),
 					"unique_id":             sensorID,
+					"object_id":             sensorID,
 					"state_topic":           stateTopic,
 					"payload_on":            "ON",
 					"payload_off":           "OFF",
