@@ -44,13 +44,13 @@ Dahua NVR ──HTTP POST──> dahua2mqtt ──MQTT──> Home Assistant
 ## Building
 
 ```bash
-go build -o dahua2mqtt .
+go build -ldflags="-s -w" -o dahua2mqtt .
 ```
 
 Cross-compile for a remote Linux server:
 
 ```bash
-GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -o dahua2mqtt .
+GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -ldflags="-s -w" -o dahua2mqtt .
 ```
 
 ## Installation
