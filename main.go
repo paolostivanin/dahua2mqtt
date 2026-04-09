@@ -148,7 +148,7 @@ func envOr(key, fallback string) string {
 // ===================================================================
 
 const (
-	version           = "2.0.0"
+	version           = "2.0.1"
 	topicPrefix       = "dahua2mqtt"
 	haDiscoveryPrefix = "homeassistant"
 )
