@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -642,6 +643,33 @@ func parseSlogLevel(s string) slog.Level {
 // ===================================================================
 
 func main() {
+	showVersion := flag.Bool("v", false, "Print version and exit")
+	flag.Usage = func() {
+		fmt.Fprintf(os.Stderr, `dahua2mqtt %s — Dahua NVR event bridge for Home Assistant via MQTT
+
+Usage: dahua2mqtt [flags]
+
+Flags:
+  -v    Print version and exit
+  -h    Show this help
+
+Configuration:
+  Reads %s (override with CONFIG_FILE env var).
+  All config keys can also be set via uppercase env vars
+  (MQTT_HOST, MQTT_PORT, PORT, LOG_LEVEL, etc).
+
+Endpoints:
+  POST /cgi-bin/NotifyEvent   Receive NVR events
+  GET  /health                Health check
+  GET  /stats                 Runtime statistics
+`, version, envOr("CONFIG_FILE", "/etc/dahua2mqtt/config.yaml"))
+	}
+	flag.Parse()
+	if *showVersion {
+		fmt.Println("dahua2mqtt", version)
+		os.Exit(0)
+	}
+
 	cfg := loadConfig()
 
 	// Set up logging
