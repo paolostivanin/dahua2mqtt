@@ -272,6 +272,9 @@ func (a *app) publishDiscovery() {
 				data, _ := json.Marshal(payload)
 				discoveryTopic := fmt.Sprintf("%s/binary_sensor/%s/config", haDiscoveryPrefix, sensorID)
 				a.mqttClient.Publish(discoveryTopic, 1, true, data)
+
+				// Publish retained OFF so HA has a known state after broker restart
+				a.mqttClient.Publish(stateTopic, 1, true, "OFF")
 				count++
 			}
 		}
@@ -329,7 +332,7 @@ func (a *app) resetOffTimer(camera, sensorType, objType string) {
 		if a.mqttClient == nil {
 			return
 		}
-		token := a.mqttClient.Publish(topic, 0, false, "OFF")
+		token := a.mqttClient.Publish(topic, 1, true, "OFF")
 		if !token.WaitTimeout(5 * time.Second) {
 			a.logger.Error("Publish OFF timed out", "topic", topic)
 		} else if token.Error() != nil {
