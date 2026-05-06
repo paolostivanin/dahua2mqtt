@@ -83,7 +83,7 @@ curl http://localhost:8080/health
 # {"mqtt_connected":true,"status":"ok"}
 
 curl http://localhost:8080/stats
-# {"version":"2.0.0","events_received":0,"mqtt_connected":true,...}
+# {"version":"2.0.2","events_received":0,"mqtt_connected":true,...}
 ```
 
 ### Resource usage
@@ -131,6 +131,7 @@ List every camera name prefix that appears in your IVS rule names. Four binary s
 |---|---|---|---|
 | `allowed_ips` | | `[]` | IP allowlist (empty = allow all) |
 | `trust_proxy` | `TRUST_PROXY` | `false` | Use `X-Forwarded-For` header for IP checks |
+| `trusted_proxies` | | `[]` | Source IPs allowed to inject `X-Forwarded-For` (when `trust_proxy=true`). Empty = trust loopback + RFC1918/ULA private nets only. |
 
 ## Object-type detection
 
@@ -183,7 +184,7 @@ GET /health
 ```
 GET /stats
 {
-  "version": "2.0.0",
+  "version": "2.0.2",
   "events_received": 145,
   "events_anti_dithered": 3,
   "events_ignored": 2,
@@ -203,13 +204,31 @@ GET /stats
 ### Root
 ```
 GET /
-dahua2mqtt 2.0.0
+dahua2mqtt 2.0.2
 ```
+
+## Removing cameras
+
+Removing a camera from `cameras:` and restarting the service stops new events
+for it but leaves the old retained MQTT discovery and state messages on the
+broker — Home Assistant will keep showing those sensors as "ghosts". Use the
+included script to clear them:
+
+```bash
+./reset_sensors.sh purge BROKER_IP <removed-cam-name> [-u user] [-P pass]
+```
+
+The same script supports a `reset` mode that publishes `OFF` to a sensor's
+state topic (without clearing it) — handy when a sensor is stuck `ON` and
+you want HA to see `OFF` immediately.
 
 ## Security Notes
 
 - Do NOT expose this bridge to the internet.
 - Use `allowed_ips` to restrict to your NVR's IP.
+- When using `trust_proxy: true` behind a reverse proxy on a non-private IP,
+  populate `trusted_proxies` with the proxy's IP. Otherwise only loopback
+  and RFC1918/ULA addresses are trusted to inject `X-Forwarded-For`.
 - Allow outbound traffic only to your MQTT broker.
 - The systemd unit enforces: read-only filesystem, no capabilities, restricted syscalls, no home directory access, private /tmp.
 

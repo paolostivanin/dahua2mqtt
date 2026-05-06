@@ -24,20 +24,22 @@ import (
 func newTestApp(cfg config) *app {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	return &app{
-		cfg:         cfg,
-		startTime:   time.Now(),
-		logger:      logger,
-		antiDither:  make(map[string]antiDitherEntry),
-		offTimers:   make(map[string]*time.Timer),
-		offTimerGen: make(map[string]uint64),
-		allowedIPs:  buildAllowedIPs(cfg.AllowedIPs),
+		cfg:            cfg,
+		startTime:      time.Now(),
+		logger:         logger,
+		antiDither:     make(map[string]antiDitherEntry),
+		offTimers:      make(map[string]*time.Timer),
+		offTimerGen:    make(map[string]uint64),
+		allowedIPs:     buildStringSet(cfg.AllowedIPs),
+		trustedProxies: buildStringSet(cfg.TrustedProxies),
+		cameraSet:      buildStringSet(cfg.Cameras),
 	}
 }
 
-func buildAllowedIPs(ips []string) map[string]struct{} {
-	m := make(map[string]struct{}, len(ips))
-	for _, ip := range ips {
-		m[ip] = struct{}{}
+func buildStringSet(items []string) map[string]struct{} {
+	m := make(map[string]struct{}, len(items))
+	for _, s := range items {
+		m[s] = struct{}{}
 	}
 	return m
 }
@@ -799,6 +801,9 @@ func TestHandleEvent_AntiDitherAllowsAfterExpiry(t *testing.T) {
 func TestHandleEvent_AntiDitherKeyWithEmptyName(t *testing.T) {
 	cfg := defaultTestConfig()
 	cfg.AntiDither = 5
+	// extractCamera("") returns "unknown"; allow it through the camera gate
+	// so this test still exercises the empty-name anti-dither key path.
+	cfg.Cameras = []string{"unknown"}
 	a := newTestApp(cfg)
 
 	data := eventData{
@@ -1281,5 +1286,154 @@ func TestResetOffTimer_MultipleTopicsIndependent(t *testing.T) {
 
 	if count != 3 {
 		t.Errorf("expected 3 independent timers, got %d", count)
+	}
+}
+
+// Locks the fix that deletes off-timer map entries after the AfterFunc fires,
+// preventing unbounded growth over time.
+func TestResetOffTimer_DeletesEntryAfterFire(t *testing.T) {
+	cfg := defaultTestConfig()
+	cfg.OffDelay = 1
+	a := newTestApp(cfg)
+
+	a.resetOffTimer("cam1", "tripwire", "human")
+
+	topic := "dahua2mqtt/cam1/tripwire/human"
+	a.offTimersMu.Lock()
+	_, exists := a.offTimers[topic]
+	a.offTimersMu.Unlock()
+	if !exists {
+		t.Fatal("timer should exist immediately after resetOffTimer")
+	}
+
+	// Wait for the timer to fire and the callback to delete the entry.
+	// OffDelay=1s + small buffer for the no-op publish path (mqttClient is nil).
+	time.Sleep(1500 * time.Millisecond)
+
+	a.offTimersMu.Lock()
+	_, stillExists := a.offTimers[topic]
+	_, genExists := a.offTimerGen[topic]
+	timerCount := len(a.offTimers)
+	genCount := len(a.offTimerGen)
+	a.offTimersMu.Unlock()
+
+	if stillExists {
+		t.Errorf("offTimers entry for %q should be deleted after firing", topic)
+	}
+	if genExists {
+		t.Errorf("offTimerGen entry for %q should be deleted after firing", topic)
+	}
+	if timerCount != 0 {
+		t.Errorf("offTimers should be empty, got %d entries", timerCount)
+	}
+	if genCount != 0 {
+		t.Errorf("offTimerGen should be empty, got %d entries", genCount)
+	}
+}
+
+// ===================================================================
+// IPv6 + TRUSTED-PROXY TESTS
+// ===================================================================
+
+func TestIPAllowlist_AllowedIPv6(t *testing.T) {
+	cfg := defaultTestConfig()
+	cfg.AllowedIPs = []string{"::1"}
+	a := newTestApp(cfg)
+
+	inner := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		fmt.Fprint(w, "ok")
+	})
+
+	handler := a.ipAllowlistMiddleware(inner)
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.RemoteAddr = "[::1]:12345"
+	w := httptest.NewRecorder()
+
+	handler.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("status = %d, want %d (IPv6 allowlist match)", w.Code, http.StatusOK)
+	}
+}
+
+// Verifies the trusted-proxy fix: a public-IP client cannot spoof X-Forwarded-For
+// to bypass the allowlist. Before the fix, this would have returned 200.
+func TestIPAllowlist_TrustProxy_UntrustedProxyRejected(t *testing.T) {
+	cfg := defaultTestConfig()
+	cfg.AllowedIPs = []string{"10.0.0.5"}
+	cfg.TrustProxy = true
+	// trusted_proxies empty → fall back to RFC1918/loopback only.
+	a := newTestApp(cfg)
+
+	inner := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		fmt.Fprint(w, "ok")
+	})
+
+	handler := a.ipAllowlistMiddleware(inner)
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.RemoteAddr = "8.8.8.8:1234" // public IP, NOT a trusted proxy
+	req.Header.Set("X-Forwarded-For", "10.0.0.5")
+	w := httptest.NewRecorder()
+
+	handler.ServeHTTP(w, req)
+
+	if w.Code != http.StatusForbidden {
+		t.Errorf("status = %d, want %d (X-Forwarded-For from untrusted proxy must be ignored)", w.Code, http.StatusForbidden)
+	}
+}
+
+// Same scenario as above, but with trusted_proxies explicitly listing the
+// public IP — header should now be honored.
+func TestIPAllowlist_TrustProxy_ExplicitTrustedProxy(t *testing.T) {
+	cfg := defaultTestConfig()
+	cfg.AllowedIPs = []string{"10.0.0.5"}
+	cfg.TrustProxy = true
+	cfg.TrustedProxies = []string{"8.8.8.8"}
+	a := newTestApp(cfg)
+
+	inner := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		fmt.Fprint(w, "ok")
+	})
+
+	handler := a.ipAllowlistMiddleware(inner)
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.RemoteAddr = "8.8.8.8:1234"
+	req.Header.Set("X-Forwarded-For", "10.0.0.5")
+	w := httptest.NewRecorder()
+
+	handler.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("status = %d, want %d (explicitly trusted proxy)", w.Code, http.StatusOK)
+	}
+}
+
+// ===================================================================
+// CAMERA ALLOWLIST TEST
+// ===================================================================
+
+func TestHandleEvent_RejectsUnknownCamera(t *testing.T) {
+	cfg := defaultTestConfig() // Cameras = [cam1, cam2]
+	a := newTestApp(cfg)
+
+	data := eventData{
+		Code:         "CrossLineDetection",
+		Name:         "cam99_r1_h_trip",
+		EventUUIDStr: "uuid-1",
+	}
+
+	a.handleEvent("uuid-1", data)
+
+	if got := a.stats.EventsIgnored.Load(); got != 1 {
+		t.Errorf("events_ignored = %d, want 1 (unknown camera should be ignored)", got)
+	}
+	if got := a.stats.MQTTPublishOK.Load(); got != 0 {
+		t.Errorf("mqtt_publish_ok = %d, want 0 (no publish for unknown camera)", got)
+	}
+	a.offTimersMu.Lock()
+	count := len(a.offTimers)
+	a.offTimersMu.Unlock()
+	if count != 0 {
+		t.Errorf("off timers = %d, want 0 (no timer scheduled for unknown camera)", count)
 	}
 }

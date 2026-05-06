@@ -172,6 +172,53 @@ sudo systemctl daemon-reload
 3. If you changed the HTTP port, update the NVR's notification URL back to the old port
 4. Re-enable HA webhook automations
 
+## Upgrade notes (in-version)
+
+These behavior changes apply when upgrading an existing dahua2mqtt
+installation, regardless of whether you're coming from the old Python proxy.
+
+### Camera allowlist now enforced
+
+Events for cameras not listed in `cameras:` are now dropped (counted under
+`events_ignored`) instead of being silently published to MQTT. This prevents
+orphan retained topics in the broker that have no Home Assistant discovery.
+
+If you intentionally relied on auto-publishing for new/unlisted cameras, add
+them to `cameras:` in your config. The change is a no-op for setups that
+already kept `cameras:` in sync with the NVR.
+
+### `trusted_proxies` now required for public-IP reverse proxies
+
+When `trust_proxy: true` is set, the `X-Forwarded-For` header is now only
+honored if the immediate connection comes from a trusted proxy. By default,
+loopback and RFC1918/ULA private addresses are trusted automatically — so
+typical LAN setups behind nginx/caddy on a private IP need no change.
+
+If your reverse proxy sits on a public IP (or any non-private address), you
+must list it explicitly:
+
+```yaml
+trust_proxy: true
+trusted_proxies:
+  - "203.0.113.10"   # the proxy's IP
+```
+
+Without this, requests with spoofed `X-Forwarded-For` headers cannot bypass
+the `allowed_ips` check.
+
+### Removing a camera now requires a `purge` step
+
+To fully remove a camera and its sensors from Home Assistant after deleting
+it from `cameras:`, run:
+
+```bash
+./reset_sensors.sh purge BROKER_IP <removed-cam-name> [-u user] [-P pass]
+```
+
+This clears the retained discovery and state topics for that camera. Without
+this, ghost sensors persist in HA because the broker still holds the
+retained discovery payload.
+
 ## HA automation migration example
 
 **Old** (webhook-based, required manual parsing):

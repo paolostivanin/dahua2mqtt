@@ -27,6 +27,13 @@ port: 8080
 # Set to true if behind a reverse proxy, to check X-Forwarded-For header.
 # trust_proxy: false
 
+# When trust_proxy is true, X-Forwarded-For is only honored if the immediate
+# client IP appears in this list. Leave empty to fall back to "loopback or
+# RFC1918/ULA private addresses only" (suitable for most LAN setups).
+# Set explicitly when running behind a reverse proxy on a public IP.
+# trusted_proxies:
+#   - "192.168.1.1"
+
 # ─── Logging ─────────────────────────────────────────────────────
 logfile: "/var/log/dahua2mqtt/dahua2mqtt.log"
 log_level: "INFO"          # DEBUG / INFO / WARNING / ERROR

@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -32,15 +33,16 @@ type mqttConfig struct {
 }
 
 type config struct {
-	MQTT       mqttConfig `yaml:"mqtt"`
-	Cameras    []string   `yaml:"cameras"`
-	Port       int        `yaml:"port"`
-	Logfile    string     `yaml:"logfile"`
-	LogLevel   string     `yaml:"log_level"`
-	AllowedIPs []string   `yaml:"allowed_ips"`
-	TrustProxy bool       `yaml:"trust_proxy"`
-	AntiDither int        `yaml:"anti_dither"`
-	OffDelay   int        `yaml:"off_delay"`
+	MQTT           mqttConfig `yaml:"mqtt"`
+	Cameras        []string   `yaml:"cameras"`
+	Port           int        `yaml:"port"`
+	Logfile        string     `yaml:"logfile"`
+	LogLevel       string     `yaml:"log_level"`
+	AllowedIPs     []string   `yaml:"allowed_ips"`
+	TrustProxy     bool       `yaml:"trust_proxy"`
+	TrustedProxies []string   `yaml:"trusted_proxies"`
+	AntiDither     int        `yaml:"anti_dither"`
+	OffDelay       int        `yaml:"off_delay"`
 }
 
 func loadConfig() config {
@@ -199,7 +201,9 @@ type app struct {
 	offTimerGen map[string]uint64
 	offTimersMu sync.Mutex
 
-	allowedIPs map[string]struct{}
+	allowedIPs     map[string]struct{}
+	trustedProxies map[string]struct{}
+	cameraSet      map[string]struct{}
 }
 
 // ===================================================================
@@ -269,7 +273,12 @@ func (a *app) publishDiscovery() {
 					},
 				}
 
-				data, _ := json.Marshal(payload)
+				data, err := json.Marshal(payload)
+				if err != nil {
+					a.logger.Error("Discovery payload marshal failed",
+						"camera", cam, "event", eventType, "object", objType, "error", err)
+					continue
+				}
 				discoveryTopic := fmt.Sprintf("%s/binary_sensor/%s/config", haDiscoveryPrefix, sensorID)
 				a.mqttClient.Publish(discoveryTopic, 1, true, data)
 
@@ -294,7 +303,8 @@ func (a *app) publishEvent(camera, sensorType, objType string) {
 		a.logger.Error("Publish failed: MQTT client not initialized", "topic", topic)
 		return
 	}
-	token := a.mqttClient.Publish(topic, 0, false, "ON")
+	// QoS 1 for at-least-once delivery; retain=false so ON doesn't stick across broker restarts.
+	token := a.mqttClient.Publish(topic, 1, false, "ON")
 	if !token.WaitTimeout(5 * time.Second) {
 		a.stats.MQTTPublishFail.Add(1)
 		a.logger.Error("Publish timed out", "topic", topic)
@@ -324,11 +334,14 @@ func (a *app) resetOffTimer(camera, sensorType, objType string) {
 	gen := a.offTimerGen[topic]
 	a.offTimers[topic] = time.AfterFunc(duration, func() {
 		a.offTimersMu.Lock()
-		current := a.offTimerGen[topic]
-		a.offTimersMu.Unlock()
-		if current != gen {
-			return // a newer timer superseded this one
+		if a.offTimerGen[topic] != gen {
+			a.offTimersMu.Unlock()
+			return // a newer timer superseded this one — leave its entry intact
 		}
+		delete(a.offTimers, topic)
+		delete(a.offTimerGen, topic)
+		a.offTimersMu.Unlock()
+
 		if a.mqttClient == nil {
 			return
 		}
@@ -370,6 +383,15 @@ type objectInfo struct {
 
 func (a *app) handleEvent(uuid string, data eventData) {
 	camera := extractCamera(data.Name)
+
+	if len(a.cameraSet) > 0 {
+		if _, ok := a.cameraSet[camera]; !ok {
+			a.stats.EventsIgnored.Add(1)
+			a.logger.Warn("Ignoring event for unknown camera",
+				"camera", camera, "name", data.Name, "uuid", uuid)
+			return
+		}
+	}
 
 	sensorType, ok := eventMap[data.Code]
 	if !ok {
@@ -472,6 +494,22 @@ func (a *app) cleanupAntiDither() {
 	for key, entry := range a.antiDither {
 		if entry.lastTime.Before(cutoff) {
 			delete(a.antiDither, key)
+		}
+	}
+}
+
+func (a *app) runAntiDitherCleanup(ctx context.Context, interval time.Duration) {
+	if a.cfg.AntiDither <= 0 {
+		return
+	}
+	t := time.NewTicker(interval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			a.cleanupAntiDither()
 		}
 	}
 }
@@ -591,24 +629,40 @@ func (a *app) ipAllowlistMiddleware(next http.Handler) http.Handler {
 		return next
 	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		remoteIP := r.RemoteAddr
+		if host, _, err := net.SplitHostPort(remoteIP); err == nil {
+			remoteIP = host
+		}
+
 		var ip string
-		if a.cfg.TrustProxy {
+		if a.cfg.TrustProxy && a.isTrustedProxy(remoteIP) {
 			forwarded := r.Header.Get("X-Forwarded-For")
 			ip = strings.TrimSpace(strings.SplitN(forwarded, ",", 2)[0])
 		} else {
-			ip = r.RemoteAddr
-			// Strip port
-			if idx := strings.LastIndex(ip, ":"); idx != -1 {
-				ip = ip[:idx]
-			}
+			ip = remoteIP
 		}
 		if _, ok := a.allowedIPs[ip]; !ok {
-			a.logger.Warn("Rejected request", "ip", ip)
+			a.logger.Warn("Rejected request", "ip", ip, "remote", remoteIP)
 			http.Error(w, "Forbidden", http.StatusForbidden)
 			return
 		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+// isTrustedProxy reports whether the given IP is allowed to inject
+// X-Forwarded-For. If trusted_proxies is configured, only those exact IPs
+// are trusted. Otherwise, fall back to loopback + RFC1918/ULA private nets.
+func (a *app) isTrustedProxy(ip string) bool {
+	if len(a.trustedProxies) == 0 {
+		parsed := net.ParseIP(ip)
+		if parsed == nil {
+			return false
+		}
+		return parsed.IsLoopback() || parsed.IsPrivate()
+	}
+	_, ok := a.trustedProxies[ip]
+	return ok
 }
 
 // ===================================================================
@@ -698,17 +752,34 @@ Endpoints:
 		allowedIPs[ip] = struct{}{}
 	}
 
+	// Build trusted proxies set (X-Forwarded-For source validation)
+	trustedProxies := make(map[string]struct{}, len(cfg.TrustedProxies))
+	for _, ip := range cfg.TrustedProxies {
+		trustedProxies[ip] = struct{}{}
+	}
+
+	// Build configured cameras set (events for unknown cameras are ignored)
+	cameraSet := make(map[string]struct{}, len(cfg.Cameras))
+	for _, c := range cfg.Cameras {
+		cameraSet[c] = struct{}{}
+	}
+
 	a := &app{
-		cfg:        cfg,
-		startTime:  time.Now(),
-		logger:     logger,
-		antiDither:  make(map[string]antiDitherEntry),
-		offTimers:   make(map[string]*time.Timer),
-		offTimerGen: make(map[string]uint64),
-		allowedIPs: allowedIPs,
+		cfg:            cfg,
+		startTime:      time.Now(),
+		logger:         logger,
+		antiDither:     make(map[string]antiDitherEntry),
+		offTimers:      make(map[string]*time.Timer),
+		offTimerGen:    make(map[string]uint64),
+		allowedIPs:     allowedIPs,
+		trustedProxies: trustedProxies,
+		cameraSet:      cameraSet,
 	}
 
 	a.setupMQTT()
+
+	cleanupCtx, cancelCleanup := context.WithCancel(context.Background())
+	go a.runAntiDitherCleanup(cleanupCtx, 60*time.Second)
 
 	// Routes
 	mux := http.NewServeMux()
@@ -721,11 +792,13 @@ Endpoints:
 	handler := a.ipAllowlistMiddleware(mux)
 
 	server := &http.Server{
-		Addr:         fmt.Sprintf(":%d", cfg.Port),
-		Handler:      handler,
-		ReadTimeout:  10 * time.Second,
-		WriteTimeout: 10 * time.Second,
-		IdleTimeout:  60 * time.Second,
+		Addr:              fmt.Sprintf(":%d", cfg.Port),
+		Handler:           handler,
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       10 * time.Second,
+		WriteTimeout:      10 * time.Second,
+		IdleTimeout:       60 * time.Second,
+		MaxHeaderBytes:    8 * 1024,
 	}
 
 	// Graceful shutdown
@@ -735,6 +808,7 @@ Endpoints:
 	go func() {
 		<-sigCh
 		logger.Info("Graceful shutdown...")
+		cancelCleanup()
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		server.Shutdown(ctx)
