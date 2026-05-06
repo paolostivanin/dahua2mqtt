@@ -83,7 +83,7 @@ curl http://localhost:8080/health
 # {"mqtt_connected":true,"status":"ok"}
 
 curl http://localhost:8080/stats
-# {"version":"2.0.2","events_received":0,"mqtt_connected":true,...}
+# {"version":"2.1.0","events_received":0,"mqtt_connected":true,...}
 ```
 
 ### Resource usage
@@ -184,7 +184,7 @@ GET /health
 ```
 GET /stats
 {
-  "version": "2.0.2",
+  "version": "2.1.0",
   "events_received": 145,
   "events_anti_dithered": 3,
   "events_ignored": 2,
@@ -204,7 +204,7 @@ GET /stats
 ### Root
 ```
 GET /
-dahua2mqtt 2.0.2
+dahua2mqtt 2.1.0
 ```
 
 ## Removing cameras
